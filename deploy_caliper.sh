@@ -256,11 +256,7 @@ npx caliper --version || { echo -e "${RED}caliper-cli无效${NC}"; exit 1; }
 
 # 绑定FISCO BCOS
 echo -e "${YELLOW}=== 绑定FISCO BCOS ===${NC}"
-npx caliper bind --caliper-bind-sut fisco-bcos --caliper-bind-sdk latest || { 
-    echo -e "${RED}绑定失败，尝试手动安装适配器...${NC}"
-    # 手动安装FISCO BCOS适配器
-    npm install @hyperledger/caliper-fisco-bcos || { echo -e "${RED}适配器安装失败${NC}"; exit 1; }
-}
+npx caliper bind --caliper-bind-sut fisco-bcos --caliper-bind-sdk latest
 
 # 下载测试案例
 echo -e "${YELLOW}=== 下载测试案例 ===${NC}"
