@@ -256,7 +256,32 @@ npx caliper --version || { echo -e "${RED}caliper-cli无效${NC}"; exit 1; }
 
 # 绑定FISCO BCOS
 echo -e "${YELLOW}=== 绑定FISCO BCOS ===${NC}"
-npx caliper bind --caliper-bind-sut fisco-bcos --caliper-bind-sdk latest
+MAX_RETRIES=100  # 最大重试次数
+RETRY_DELAY=2   # 重试间隔（秒）
+RETRY_COUNT=0   # 当前重试计数
+
+# 循环执行绑定命令，直到成功或达到最大重试次数
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    npx caliper bind --caliper-bind-sut fisco-bcos --caliper-bind-sdk latest && {
+        echo -e "${GREEN}✅ FISCO BCOS绑定成功${NC}"
+        break  # 绑定成功则退出循环
+    }
+
+    # 绑定失败，检查是否还有重试次数
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+        echo -e "${YELLOW}⚠️ 第 $RETRY_COUNT 次绑定失败，将在 $RETRY_DELAY 秒后重试...${NC}"
+        sleep $RETRY_DELAY
+    else
+        echo -e "${RED}❌ 已达到最大重试次数（$MAX_RETRIES 次），绑定失败${NC}"
+        # 尝试手动安装适配器作为最后的补救措施
+        echo -e "${YELLOW}尝试手动安装适配器...${NC}"
+        npm install @hyperledger/caliper-fisco-bcos || { 
+            echo -e "${RED}❌ 适配器手动安装也失败${NC}"
+            exit 1
+        }
+    fi
+done
 
 # 下载测试案例
 echo -e "${YELLOW}=== 下载测试案例 ===${NC}"
@@ -315,8 +340,40 @@ fi
 
 
 # 重新安装依赖
-echo -e "${YELLOW}重新安装依赖...${NC}"
-npm install --no-fund || { echo -e "${RED}依赖安装失败${NC}"; exit 1; }
+echo -e "${YELLOW}=== 重新安装依赖... ===${NC}"
+MAX_RETRIES=50          # 最大重试次数
+RETRY_DELAY=2          # 重试间隔（秒）
+RETRY_COUNT=0          # 当前重试计数
+SUCCESS=0              # 安装成功标记
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    # 执行安装命令
+    npm install --no-fund
+    
+    # 检查上一条命令执行结果（0为成功）
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✅ 依赖安装成功${NC}"
+        SUCCESS=1
+        break
+    fi
+    
+    # 安装失败，准备重试
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+        echo -e "${YELLOW}⚠️ 第 $RETRY_COUNT 次安装失败，${RETRY_DELAY}秒后重试（剩余 $((MAX_RETRIES - RETRY_COUNT)) 次）...${NC}"
+        sleep $RETRY_DELAY
+        # 清理可能的残留文件，避免影响下次安装
+        rm -rf node_modules package-lock.json
+        npm cache clean --force
+    fi
+done
+
+# 最终检查是否成功
+if [ $SUCCESS -ne 1 ]; then
+    echo -e "${RED}❌ 已尝试 $MAX_RETRIES 次，依赖安装始终失败，请检查网络或依赖配置${NC}"
+    exit 1
+fi
+
 cd "$WORK_DIR"
 
 # 执行HelloWorld测试
