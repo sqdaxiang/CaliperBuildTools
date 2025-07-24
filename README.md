@@ -82,3 +82,7 @@ chmod +x deploy_caliper.sh
 - 测试案例默认拉取自定义仓库，如需使用官方仓库可修改脚本中克隆地址
 - 部署成功后，工作目录位于脚本同级的 `caliper-workspace`
 - 若执行失败，可根据终端红色错误提示定位问题（通常为依赖缺失或文件路径错误）
+
+## gitee上有带有镜像版本
+https://gitee.com/sqdaxiang/caliper-build-tools
+（gitube不让上传太大的文件）
