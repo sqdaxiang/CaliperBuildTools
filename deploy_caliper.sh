@@ -7,54 +7,59 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' 
 
-SUDOERS_MODIFIED=false
+OS_TYPE=""
+OS_VERSION=""
 
-# 配置sudo免密权限
-configure_sudo_nopasswd() {
-    if ! sudo grep -q "$USER ALL=(ALL) NOPASSWD: ALL" /etc/sudoers; then
-        echo -e "${YELLOW}配置sudo免密权限（临时）...${NC}"
-        echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo EDITOR='tee -a' visudo > /dev/null 2>&1
-        SUDOERS_MODIFIED=true
+handle_sudo_permission() {
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
     fi
+
+    echo -e "${RED}❌ 普通用户必须通过sudo执行！请使用命令: sudo bash deploy_caliper.sh${NC}"
+    exit 1
 }
 
-# 恢复sudo配置
-restore_sudoers() {
-    if [ "$SUDOERS_MODIFIED" = "true" ]; then
-        echo -e "${YELLOW}恢复sudo权限配置...${NC}"
-        sudo sed -i "/$USER ALL=(ALL) NOPASSWD: ALL/d" /etc/sudoers > /dev/null 2>&1
+# 权限检查
+handle_sudo_permission
+
+# 系统检查与识别
+check_os() {
+    if [ -f /etc/lsb-release ]; then
+        . /etc/lsb-release
+        if [ "$DISTRIB_ID" = "Ubuntu" ]; then
+            OS_TYPE="ubuntu"
+            OS_VERSION="$DISTRIB_RELEASE"
+            echo -e "${YELLOW}=== 确认当前系统：Ubuntu ${OS_VERSION} ===${NC}"
+            return 0
+        fi
+    elif [ -f /etc/centos-release ]; then
+        if grep -q "CentOS Linux" /etc/centos-release && grep -q "7" /etc/centos-release; then
+            OS_TYPE="centos"
+            OS_VERSION="7"
+            echo -e "${YELLOW}=== 确认当前系统：CentOS ${OS_VERSION} ===${NC}"
+            return 0
+        fi
     fi
+    echo -e "${RED}此脚本仅支持Ubuntu和CentOS 7系统${NC}"
+    exit 1
 }
-trap restore_sudoers EXIT
-
-# 系统检查
-if [ ! -f /etc/lsb-release ]; then
-    echo -e "${RED}此脚本仅支持Ubuntu系统${NC}"
-    exit 1
-fi
-. /etc/lsb-release
-if [ "$DISTRIB_ID" != "Ubuntu" ]; then
-    echo -e "${RED}检测到非Ubuntu系统（${DISTRIB_ID}）${NC}"
-    exit 1
-fi
-echo -e "${YELLOW}=== 确认当前系统：Ubuntu ${DISTRIB_RELEASE} ===${NC}"
-
-# 配置sudo免密
-configure_sudo_nopasswd
-
-# 工作目录
-SCRIPT_DIR=$(cd $(dirname $0); pwd)
-# 定义镜像存放目录
-IMAGE_DIR="${SCRIPT_DIR}/images"
-echo -e "${YELLOW}=== 脚本工作目录：$SCRIPT_DIR ===${NC}"
-echo -e "${YELLOW}=== 镜像文件目录：$IMAGE_DIR ===${NC}"
 
 # 依赖检查函数
 check_dependency() {
     local dep=$1
+    local centos_dep=$2
+
+    if [ "$OS_TYPE" = "centos" ] && [ -n "$centos_dep" ]; then
+        dep=$centos_dep
+    fi
+
     if ! command -v $dep &> /dev/null; then
         echo -e "${YELLOW}安装依赖 $dep...${NC}"
-        sudo apt install -y $dep || { echo -e "${RED}依赖 $dep 安装失败！${NC}"; exit 1; }
+        if [ "$OS_TYPE" = "ubuntu" ]; then
+            apt install -y $dep || { echo -e "${RED}依赖 $dep 安装失败！${NC}"; exit 1; }
+        else
+            yum install -y $dep || { echo -e "${RED}依赖 $dep 安装失败！${NC}"; exit 1; }
+        fi
     else
         echo -e "${GREEN}依赖 $dep 已存在${NC}"
     fi
@@ -62,52 +67,45 @@ check_dependency() {
 
 # 统一的镜像检查与加载函数
 handle_docker_image() {
-    local target_image=$1       # 目标镜像（如fiscoorg/fiscobcos:latest）
-    local local_tar_path=$2     # 本地镜像tar包路径
-    local image_dir=$(dirname "$local_tar_path")  # 镜像目录
+    local target_image=$1
+    local local_tar_path=$2
+    local image_dir=$(dirname "$local_tar_path")
 
     echo -e "${YELLOW}=== 处理镜像: $target_image ===${NC}"
 
-    # 检查镜像目录是否存在
     if [ ! -d "$image_dir" ]; then
         echo -e "${RED}❌ 镜像目录 $image_dir 不存在，请创建该目录并放入镜像文件${NC}"
         exit 1
     fi
 
-    # 检查本地是否已存在目标镜像
     if docker images --format "{{.Repository}}:{{.Tag}}" | grep -q "^${target_image}$"; then
         echo -e "${GREEN}✅ 本地已存在目标镜像: $target_image${NC}"
         return 0
     fi
 
-    # 本地不存在，尝试拉取官方镜像
     echo -e "${YELLOW}本地未找到目标镜像，尝试拉取: $target_image${NC}"
     if docker pull "$target_image"; then
         echo -e "${GREEN}✅ 官方镜像拉取成功${NC}"
         return 0
     fi
 
-    # 拉取失败，尝试加载本地tar包
     echo -e "${YELLOW}⚠️ 官方镜像拉取失败，尝试加载本地镜像: $local_tar_path${NC}"
     if [ ! -f "$local_tar_path" ]; then
         echo -e "${RED}❌ 本地镜像文件 $local_tar_path 不存在，无法加载${NC}"
         exit 1
     fi
 
-    # 加载本地镜像并校验标签
     if ! docker load -i "$local_tar_path"; then
         echo -e "${RED}❌ 本地镜像加载失败: $local_tar_path${NC}"
         exit 1
     fi
 
-    # 提取加载后的镜像名（处理可能的标签不一致问题）
     local loaded_image=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -i "$(echo "$target_image" | cut -d: -f1)" | head -n1)
     if [ -z "$loaded_image" ]; then
         echo -e "${RED}❌ 加载的本地镜像无法匹配目标镜像: $target_image${NC}"
         exit 1
     fi
 
-    # 统一标签为目标镜像名
     if [ "$loaded_image" != "$target_image" ]; then
         docker tag "$loaded_image" "$target_image"
     fi
@@ -116,29 +114,70 @@ handle_docker_image() {
     return 0
 }
 
+# 主流程开始
+check_os
+
+# 脚本目录配置
+SCRIPT_DIR=$(cd "$(dirname "$0")" &>/dev/null && pwd)
+sudo chown -R "$(logname)":"$(logname)" "$SCRIPT_DIR" 
+sudo chmod -R 755 "$SCRIPT_DIR"
+
+# 工作目录配置
+IMAGE_DIR="${SCRIPT_DIR}/images"
+echo -e "${YELLOW}=== 脚本工作目录：$SCRIPT_DIR ===${NC}"
+echo -e "${YELLOW}=== 镜像文件目录：$IMAGE_DIR ===${NC}"
+
 # 安装系统依赖
 echo -e "${YELLOW}=== 检查系统核心依赖 ===${NC}"
-dependencies=("make" "g++" "gcc" "git" "curl" "wget" "apt-transport-https" "ca-certificates" "software-properties-common" "build-essential" "libssl-dev")
-for dep in "${dependencies[@]}"; do
-    check_dependency $dep
-done
+if [ "$OS_TYPE" = "ubuntu" ]; then
+    dependencies=(
+        "make" "g++" "gcc" "git" "curl" "wget"
+        "apt-transport-https" "ca-certificates"
+        "software-properties-common" "build-essential" "libssl-dev"
+    )
+    for dep in "${dependencies[@]}"; do
+        check_dependency $dep
+    done
+else
+    # CentOS 7依赖映射
+    dependencies=(
+        "make" ""
+        "g++" "gcc-c++"
+        "gcc" ""
+        "git" ""
+        "curl" ""
+        "wget" ""
+        "apt-transport-https" "epel-release"  
+        "ca-certificates" ""
+        "software-properties-common" "yum-utils"  
+        "build-essential" "gcc-c++" 
+        "libssl-dev" "openssl-devel" 
+    )
+    for ((i=0; i<${#dependencies[@]}; i+=2)); do
+        dep=${dependencies[i]}
+        centos_dep=${dependencies[i+1]}
+        check_dependency "$dep" "$centos_dep"
+    done
+    check_dependency "policycoreutils-python"
+fi
 
 # 检查并安装Docker
 echo -e "${YELLOW}=== 检查Docker环境 ===${NC}"
-
 if ! command -v docker &> /dev/null; then
     echo -e "${YELLOW}Docker未安装，开始安装（阿里云源）...${NC}"
-    # 彻底清理旧的Docker GPG密钥
-    sudo apt-key del 0EBFCD88 > /dev/null 2>&1 || true
-    # 添加阿里云Docker源
-    curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | sudo apt-key add -
-    sudo add-apt-repository "deb [arch=amd64] https://mirrors.aliyun.com/docker-ce/linux/ubuntu $(lsb_release -cs) stable" -y
-    # 更新源并安装Docker
-    sudo apt update -y --fix-missing
-    sudo apt install -y docker-ce docker-ce-cli containerd.io || { echo -e "${RED}Docker安装失败！${NC}"; exit 1; }
-    sudo systemctl start docker && sudo systemctl enable docker
-    sudo usermod -aG docker $USER
-    echo -e "${YELLOW}Docker安装完成！注意：Docker权限变更需重新登录生效${NC}"
+    if [ "$OS_TYPE" = "ubuntu" ]; then
+        apt-key del 0EBFCD88 > /dev/null 2>&1 || true
+        curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | apt-key add -
+        add-apt-repository "deb [arch=amd64] https://mirrors.aliyun.com/docker-ce/linux/ubuntu $(lsb_release -cs) stable" -y
+        apt update -y --fix-missing
+        apt install -y docker-ce docker-ce-cli containerd.io || { echo -e "${RED}Docker安装失败！${NC}"; exit 1; }
+    else
+        yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine
+        yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+        yum install -y docker-ce docker-ce-cli containerd.io || { echo -e "${RED}Docker安装失败！${NC}"; exit 1; }
+    fi
+    systemctl start docker && systemctl enable docker
+    usermod -aG docker "$(logname)"  
 else
     echo -e "${GREEN}Docker已安装${NC}"
     docker --version
@@ -147,27 +186,29 @@ fi
 # 离线安装Docker Compose
 echo -e "${YELLOW}=== 离线安装 Docker Compose ===${NC}"
 COMPOSE_FILE="/usr/local/bin/docker-compose"
-LOCAL_COMPOSE="$SCRIPT_DIR/bin/docker-compose-Linux-x86_64"
+LOCAL_COMPOSE="$SCRIPT_DIR/bin/docker-compose-linux-x86_64"
 
-if [ ! -f "$LOCAL_COMPOSE" ]; then
-    echo -e "${RED}❌ 未找到本地 docker-compose 文件：$LOCAL_COMPOSE${NC}"
-    exit 1
-fi
-
-if ! command -v docker-compose &> /dev/null; then
-    echo -e "${YELLOW}从本地文件安装 docker-compose...${NC}"
-    sudo cp "$LOCAL_COMPOSE" "$COMPOSE_FILE"
-    sudo chmod +x "$COMPOSE_FILE"
-    sudo ln -sf "$COMPOSE_FILE" /usr/bin/docker-compose
+if command -v docker-compose &>/dev/null; then
+    current_version=$(docker-compose --version | awk '{print $3}' | cut -d',' -f1)
+    echo -e "${GREEN}ℹ️ Docker Compose已安装，当前版本：$current_version${NC}"
 else
-    echo -e "${GREEN}Docker Compose已安装${NC}"
-fi
+    echo -e "${YELLOW}ℹ️ 未检测到Docker Compose，开始离线安装...${NC}"
 
-if ! docker-compose --version &> /dev/null; then
-    echo -e "${RED}❌ Docker Compose 安装失败！${NC}"
-    exit 1
-else
-    echo -e "${GREEN}✅ Docker Compose 安装成功：$(docker-compose --version)${NC}"
+    if cp "$LOCAL_COMPOSE" "$COMPOSE_FILE"; then
+        chmod +x "$COMPOSE_FILE"
+        
+        if command -v docker-compose &>/dev/null; then
+            installed_version=$(docker-compose --version | awk '{print $3}' | cut -d',' -f1)
+            echo -e "${GREEN}✅ Docker Compose安装成功！版本：$installed_version${NC}"
+        else
+            echo -e "${RED}❌ 安装失败：文件已复制，但无法识别docker-compose命令${NC}"
+            echo -e "${RED}   检查：/usr/local/bin是否在PATH中？执行 echo $PATH 确认${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}❌ 安装失败：无法复制文件到$COMPOSE_FILE${NC}"
+        exit 1
+    fi
 fi
 
 # 处理FISCO BCOS镜像
@@ -182,10 +223,15 @@ handle_docker_image \
 
 # 安装NVM
 echo -e "${YELLOW}=== 安装NVM ===${NC}"
-NVM_DIR="$HOME/.nvm"
-NVM_VERSION="v0.33.2"
-NVM_REPO_GITHUB="https://github.com/creationix/nvm.git"
+NVM_DIR="/usr/local/nvm"  
+NVM_VERSION="v0.39.3"    
+NVM_REPO_GITHUB="https://github.com/nvm-sh/nvm.git"
 NVM_REPO_GITEE="https://gitee.com/mirrors/nvm.git"
+
+# 确保目录权限
+mkdir -p "$NVM_DIR"
+chmod -R 775 "$NVM_DIR"
+chown -R "$(logname)":"$(logname)" "$NVM_DIR"  
 
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     \. "$NVM_DIR/nvm.sh"
@@ -196,8 +242,9 @@ if command -v nvm &> /dev/null && nvm --version &> /dev/null; then
 else
     echo -e "${YELLOW}NVM未安装或无效，开始安装/修复...${NC}"
     if [ -d "$NVM_DIR" ]; then
-        echo -e "${YELLOW}清理残留的NVM目录...${NC}"
         rm -rf "$NVM_DIR"
+        mkdir -p "$NVM_DIR"
+        chown -R "$(logname)":"$(logname)" "$NVM_DIR"
     fi
     
     echo -e "${YELLOW}尝试从GitHub克隆NVM仓库...${NC}"
@@ -209,10 +256,13 @@ else
         fi
     fi
     
-    echo -e "${YELLOW}配置NVM环境...${NC}"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+    # 配置全局环境变量
+    echo "export NVM_DIR=\"$NVM_DIR\"" >> /etc/profile.d/nvm.sh
+    echo "[ -s \"$NVM_DIR/nvm.sh\" ] && \. \"$NVM_DIR/nvm.sh\"" >> /etc/profile.d/nvm.sh
+    chmod +x /etc/profile.d/nvm.sh
+    \. /etc/profile.d/nvm.sh  # 立即加载
     
-    if ! command -v nvm &> /dev/null || ! nvm --version &> /dev/null; then
+    if ! command -v nvm &> /dev/null; then
         echo -e "${RED}NVM配置失败${NC}"
         exit 1
     fi
@@ -234,54 +284,94 @@ nvm alias default 8
 echo -e "${GREEN}当前Node版本：$(node -v)${NC}"
 echo -e "${GREEN}当前npm版本：$(npm -v)${NC}"
 
+# 工作目录配置
+WORK_DIR="$SCRIPT_DIR/caliper-workspace"
+echo -e "${YELLOW}=== 准备工作目录：$WORK_DIR ===${NC}"
+
+# 先删除旧目录
+if [ -d "$WORK_DIR" ]; then
+    rm -rf "$WORK_DIR" || { echo -e "${RED}❌ 无法删除旧工作目录${NC}"; exit 1; }
+fi
+
+# 重新创建目录并立即设置权限
+mkdir -p "$WORK_DIR" || { echo -e "${RED}❌ 无法创建工作目录${NC}"; exit 1; }
+chown -R "$(logname)":"$(logname)" "$WORK_DIR"  
+chmod -R 775 "$WORK_DIR"                       
+cd "$WORK_DIR" || { echo -e "${RED}❌ 无法进入工作目录${NC}"; exit 1; }
+echo -e "${GREEN}✅ 工作目录准备完成${NC}"
+
 # 配置npm国内镜像
 echo -e "${YELLOW}=== 配置npm国内镜像 ===${NC}"
+# 先以root身份配置全局镜像（确保普通用户继承）
 npm config set registry https://registry.npmmirror.com
 npm config set disturl https://npmmirror.com/dist
 
-# 初始化工作目录
-WORK_DIR="$SCRIPT_DIR/caliper-workspace"
-sudo rm -rf "$WORK_DIR"  # 清理旧目录避免冲突
-mkdir -p "$WORK_DIR" && cd "$WORK_DIR"
-echo -e "${YELLOW}=== 工作目录：$WORK_DIR ===${NC}"
+# 配置npm缓存目录
+NPM_CACHE_DIR="${WORK_DIR}/.npm-cache"
+mkdir -p "$NPM_CACHE_DIR"
+chown -R "$(logname)":"$(logname)" "$NPM_CACHE_DIR"
+chmod -R 775 "$NPM_CACHE_DIR"
+npm config set cache "$NPM_CACHE_DIR"
 
 # 初始化NPM项目
 echo -e "${YELLOW}初始化NPM项目...${NC}"
-npm init -y --silent
+sudo -u "$(logname)" bash -c "\
+    source /etc/profile.d/nvm.sh && \
+    nvm use 8 > /dev/null 2>&1 && \
+    npm init -y --silent" || { 
+    echo -e "${RED}❌ NPM项目初始化失败${NC}"; exit 1; 
+}
 
-# 安装指定版本的caliper-cli
+# 安装caliper-cli
 echo -e "${YELLOW}=== 安装caliper-cli@0.2.0 ===${NC}"
-npm install --only=prod @hyperledger/caliper-cli@0.2.0 || { echo -e "${RED}caliper-cli安装失败${NC}"; exit 1; }
-npx caliper --version || { echo -e "${RED}caliper-cli无效${NC}"; exit 1; }
+sudo -u "$(logname)" bash -c "\
+    source /etc/profile.d/nvm.sh && \
+    nvm use 8 > /dev/null 2>&1 && \
+    npm install --only=prod @hyperledger/caliper-cli@0.2.0" || { 
+    echo -e "${RED}❌ caliper-cli安装失败${NC}"; exit 1; 
+}
+
+# 验证caliper版本
+sudo -u "$(logname)" bash -c "\
+    source /etc/profile.d/nvm.sh && \
+    nvm use 8 > /dev/null 2>&1 && \
+    npx caliper --version" || { 
+    echo -e "${RED}❌ caliper-cli无效${NC}"; exit 1; 
+}
+
+# 配置Git临时目录权限
+GIT_TMP_DIR="${WORK_DIR}/.git-tmp"
+mkdir -p "$GIT_TMP_DIR"
+chown -R "$(logname)":"$(logname)" "$GIT_TMP_DIR"
+chmod -R 775 "$GIT_TMP_DIR"
+git config --global core.tempdir "$GIT_TMP_DIR"
 
 # 绑定FISCO BCOS
 echo -e "${YELLOW}=== 绑定FISCO BCOS ===${NC}"
-MAX_RETRIES=100  # 最大重试次数
-RETRY_DELAY=2   # 重试间隔（秒）
-RETRY_COUNT=0   # 当前重试计数
+MAX_RETRIES=100
+RETRY_DELAY=2
+RETRY_COUNT=0
 
-# 循环执行绑定命令，直到成功或达到最大重试次数
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    npx caliper bind --caliper-bind-sut fisco-bcos --caliper-bind-sdk latest && {
+    sudo -u "$(logname)" bash -c "\
+        source /etc/profile.d/nvm.sh && \
+        nvm use 8 > /dev/null 2>&1 && \
+        cd $WORK_DIR && \
+        npx caliper bind --caliper-bind-sut fisco-bcos --caliper-bind-sdk latest" && {
         echo -e "${GREEN}✅ FISCO BCOS绑定成功${NC}"
-        break  # 绑定成功则退出循环
+        break
     }
 
-    # 绑定失败，检查是否还有重试次数
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-        echo -e "${YELLOW}⚠️ 第 $RETRY_COUNT 次绑定失败，将在 $RETRY_DELAY 秒后重试...${NC}"
+        echo -e "${YELLOW}⚠️ 绑定失败，${RETRY_DELAY}秒后重试...（第${RETRY_COUNT}次）${NC}"
         sleep $RETRY_DELAY
     else
-        echo -e "${RED}❌ 已达到最大重试次数（$MAX_RETRIES 次），绑定失败${NC}"
-        # 尝试手动安装适配器作为最后的补救措施
-        echo -e "${YELLOW}尝试手动安装适配器...${NC}"
-        npm install @hyperledger/caliper-fisco-bcos || { 
-            echo -e "${RED}❌ 适配器手动安装也失败${NC}"
-            exit 1
-        }
+        echo -e "${RED}❌ 已达到最大重试次数，绑定失败${NC}"
+        exit 1
     fi
 done
+
 
 # 下载测试案例
 echo -e "${YELLOW}=== 下载测试案例 ===${NC}"
@@ -289,7 +379,7 @@ if [ ! -d "caliper-benchmarks" ]; then
     if ! git clone https://github.com/vita-dounai/caliper-benchmarks.git; then
         echo -e "${YELLOW}GitHub克隆失败，尝试Gitee...${NC}"
         if ! git clone https://gitee.com/vita-dounai/caliper-benchmarks.git; then
-            echo -e "${RED}测试案例下载失败！请手动克隆仓库${NC}"; exit 1
+            echo -e "${RED}测试案例下载失败！${NC}"; exit 1
         fi
     fi
 else
@@ -299,17 +389,15 @@ fi
 # 修改配置文件
 echo -e "${YELLOW}=== 修改配置文件 ===${NC}"
 
-# 处理 fiscoBcos.js
 FILE="$WORK_DIR/node_modules/@hyperledger/caliper-fisco-bcos/lib/fiscoBcos.js"
 if [ ! -f "$FILE" ]; then
     echo -e "${RED}❌ 未找到文件: $FILE${NC}"
     exit 1
 fi
 sed -i "s#const Color = require('./common');#const Color = require('./common').Color;#" "$FILE"
-sed -i "/this\.fiscoBcosSettings = CaliperUtils\.parseYaml(this\.configPath)\['fisco-bcos'\];/a \    if (this.fiscoBcosSettings.network && this.fiscoBcosSettings.network.authentication) {\n        for (let k in this.fiscoBcosSettings.network.authentication) {\n            this.fiscoBcosSettings.network.authentication[k] = CaliperUtils.resolvePath(this.fiscoBcosSettings.network.authentication[k], workspace_root);\n        }\n    }"  "$FILE"
+sed -i '/this\.fiscoBcosSettings = CaliperUtils\.parseYaml(this\.configPath)\['\''fisco-bcos'\''\];/a \    if (this.fiscoBcosSettings.network && this.fiscoBcosSettings.network.authentication) {\n        for (let k in this.fiscoBcosSettings.network.authentication) {\n            this.fiscoBcosSettings.network.authentication[k] = CaliperUtils.resolvePath(this.fiscoBcosSettings.network.authentication[k], workspace_root);\n        }\n    }' "$FILE"
 sed -i "s#const fiscoBcosSettings = CaliperUtils.parseYaml(this.configPath)\['fisco-bcos'\];#const fiscoBcosSettings = this.fiscoBcosSettings;#" "$FILE"
 
-# 处理 channelPromise.js
 FILE="$WORK_DIR/node_modules/@hyperledger/caliper-fisco-bcos/lib/channelPromise.js"
 if [ ! -f "$FILE" ]; then
     echo -e "${RED}❌ 未找到文件: $FILE${NC}"
@@ -317,7 +405,6 @@ if [ ! -f "$FILE" ]; then
 fi
 sed -i "s#let emitter = emitters.get(seq)\.emitter;#let emitter = emitters.get(seq);\n    if(!emitter) {\n        return;\n    }\n    emitter = emitter.emitter;#" "$FILE"
 
-# 处理 web3sync.js
 FILE="$WORK_DIR/node_modules/@hyperledger/caliper-fisco-bcos/lib/web3lib/web3sync.js" 
 if [ ! -f "$FILE" ]; then
     echo -e "${RED}❌ 未找到文件: $FILE${NC}"
@@ -332,56 +419,57 @@ cd "$WORK_DIR/node_modules/@hyperledger/caliper-fisco-bcos/" || {
     exit 1
 }
 
-
 if ! grep -q '"secp256k1"' package.json; then
     check_dependency jq
     jq '.dependencies["secp256k1"] = "^3.8.0"' package.json > temp.json && mv temp.json package.json
+    chown "$(logname)":"$(logname)" package.json
 fi
-
 
 # 重新安装依赖
 echo -e "${YELLOW}=== 重新安装依赖... ===${NC}"
-MAX_RETRIES=50          # 最大重试次数
-RETRY_DELAY=2          # 重试间隔（秒）
-RETRY_COUNT=0          # 当前重试计数
-SUCCESS=0              # 安装成功标记
+MAX_RETRIES=100
+RETRY_DELAY=2
+RETRY_COUNT=0
+SUCCESS=0
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    # 执行安装命令
-    npm install --no-fund
+    sudo -u "$(logname)" bash -c "\
+        source /etc/profile.d/nvm.sh && \
+        nvm use 8 > /dev/null 2>&1 && \
+        npm install --no-fund"
     
-    # 检查上一条命令执行结果（0为成功）
+    # 检查命令执行结果
     if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✅ 依赖安装成功${NC}"
         SUCCESS=1
         break
     fi
     
-    # 安装失败，准备重试
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-        echo -e "${YELLOW}⚠️ 第 $RETRY_COUNT 次安装失败，${RETRY_DELAY}秒后重试（剩余 $((MAX_RETRIES - RETRY_COUNT)) 次）...${NC}"
+        echo -e "${YELLOW}⚠️ 依赖安装失败，${RETRY_DELAY}秒后重试）${NC}"
         sleep $RETRY_DELAY
-        # 清理可能的残留文件，避免影响下次安装
-        rm -rf node_modules package-lock.json
-        npm cache clean --force
+        sudo -u "$(logname)" rm -rf node_modules package-lock.json
+        sudo -u "$(logname)" npm cache clean --force
     fi
 done
 
-# 最终检查是否成功
 if [ $SUCCESS -ne 1 ]; then
-    echo -e "${RED}❌ 已尝试 $MAX_RETRIES 次，依赖安装始终失败，请检查网络或依赖配置${NC}"
+    echo -e "${RED}❌ 已达到最大重试次数，依赖安装失败${NC}"
+    echo -e "${YELLOW}请检查网络连接或手动配置GitHub镜像后重试${NC}"
     exit 1
 fi
 
-cd "$WORK_DIR"
+# 回到工作目录
+cd "$WORK_DIR" || exit 1
 
 # 执行HelloWorld测试
 echo -e "${YELLOW}=== 执行HelloWorld合约测试 ===${NC}"
+
 npx caliper benchmark run \
     --caliper-workspace caliper-benchmarks \
     --caliper-benchconfig benchmarks/samples/fisco-bcos/helloworld/config.yaml \
-    --caliper-networkconfig networks/fisco-bcos/4nodes1group/fisco-bcos.json || { echo -e "${RED}测试执行失败${NC}"; exit 1; }
+    --caliper-networkconfig networks/fisco-bcos/4nodes1group/fisco-bcos.json \
+    || { echo -e "${RED}测试执行失败${NC}"; exit 1; }
 
 echo -e "${GREEN}=== 所有操作完成，环境搭建成功！ ===${NC}"
 echo -e "${GREEN}工作目录：$WORK_DIR${NC}"
