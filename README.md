@@ -61,11 +61,11 @@
 # 赋予执行权限
 chmod +x deploy_caliper.sh
 
-# 执行部署（联网环境）
-./deploy_caliper.sh
-
-# 离线环境执行（需确保 images 目录下有必备镜像文件）
-./deploy_caliper.sh
+# 执行部署
+# root用户
+bash deploy_caliper.sh
+# 普通用户
+sudo bash deploy_caliper.sh
 ```
 
 
