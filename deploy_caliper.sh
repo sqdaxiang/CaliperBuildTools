@@ -19,6 +19,22 @@ handle_sudo_permission() {
     exit 1
 }
 
+replace_centos_repo() {
+    mv /etc/yum.repos.d/CentOS-Base.repo /etc/yum.repos.d/CentOS-Base.repo.bak &> /dev/null || true
+    
+    if curl -o /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-7.repo; then
+        echo -e "${GREEN}✅ 阿里云YUM源配置成功${NC}"
+    else
+        echo -e "${YELLOW}⚠️ 阿里云源下载失败，尝试腾讯云源${NC}"
+        if curl -o /etc/yum.repos.d/CentOS-Base.repo https://mirrors.cloud.tencent.com/repo/centos7_base.repo; then
+            echo -e "${GREEN}✅ 腾讯云YUM源配置成功${NC}"
+        else
+            echo -e "${RED}❌ 国内YUM源配置失败，请检查网络${NC}"
+            exit 1
+        fi
+    fi
+}
+
 # 权限检查
 handle_sudo_permission
 
@@ -116,6 +132,11 @@ handle_docker_image() {
 
 # 主流程开始
 check_os
+
+# 针对CentOS 7系统更换国内YUM源
+if [ "$OS_TYPE" = "centos" ] && [ "$OS_VERSION" = "7" ]; then
+    replace_centos_repo
+fi
 
 # 脚本目录配置
 SCRIPT_DIR=$(cd "$(dirname "$0")" &>/dev/null && pwd)
@@ -224,14 +245,14 @@ handle_docker_image \
 # 安装NVM
 echo -e "${YELLOW}=== 安装NVM ===${NC}"
 NVM_DIR="/usr/local/nvm"  
-NVM_VERSION="v0.39.3"    
+NVM_VERSION="v0.33.2"    
 NVM_REPO_GITHUB="https://github.com/nvm-sh/nvm.git"
 NVM_REPO_GITEE="https://gitee.com/mirrors/nvm.git"
 
 # 确保目录权限
 mkdir -p "$NVM_DIR"
 chmod -R 775 "$NVM_DIR"
-chown -R "$(logname)":"$(logname)" "$NVM_DIR"  
+chown -R "$USER:$USER" "$NVM_DIR" 
 
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     \. "$NVM_DIR/nvm.sh"
@@ -244,7 +265,7 @@ else
     if [ -d "$NVM_DIR" ]; then
         rm -rf "$NVM_DIR"
         mkdir -p "$NVM_DIR"
-        chown -R "$(logname)":"$(logname)" "$NVM_DIR"
+        chown -R "$USER:$USER" "$NVM_DIR"
     fi
     
     echo -e "${YELLOW}尝试从GitHub克隆NVM仓库...${NC}"
@@ -260,7 +281,7 @@ else
     echo "export NVM_DIR=\"$NVM_DIR\"" >> /etc/profile.d/nvm.sh
     echo "[ -s \"$NVM_DIR/nvm.sh\" ] && \. \"$NVM_DIR/nvm.sh\"" >> /etc/profile.d/nvm.sh
     chmod +x /etc/profile.d/nvm.sh
-    \. /etc/profile.d/nvm.sh  # 立即加载
+    \. /etc/profile.d/nvm.sh  
     
     if ! command -v nvm &> /dev/null; then
         echo -e "${RED}NVM配置失败${NC}"
@@ -271,16 +292,35 @@ fi
 
 # 安装Node.js 8
 echo -e "${YELLOW}=== 安装Node.js 8 ===${NC}"
+NODE8_VERSION="8.17.0"
+NODE8_CACHE_DIR="$NVM_DIR/.cache/bin/node-v${NODE8_VERSION}-linux-x64"
+rm -rf "$NODE8_CACHE_DIR"
+export NVM_NODEJS_ORG_MIRROR="https://mirrors.aliyun.com/nodejs-release"
 if ! nvm ls 8 &> /dev/null; then
     echo -e "${YELLOW}Node.js 8未安装，开始安装...${NC}"
-    if ! nvm install 8; then
-        echo -e "${RED}Node.js 8安装失败！${NC}"
+    MAX_RETRIES=100
+    RETRY_COUNT=0
+    INSTALL_SUCCESS=0
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        if nvm install "$NODE8_VERSION"; then
+            INSTALL_SUCCESS=1
+            break
+        else
+            echo -e "${RED}安装失败,等待2秒后重试...${NC}"
+            rm -rf "$NODE8_CACHE_DIR"
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            sleep 2
+        fi
+    done
+
+    if [ $INSTALL_SUCCESS -ne 1 ]; then
+        echo -e "${RED}已达最大重试次数，Node.js $NODE8_VERSION 安装失败，请尝试重新运行脚本${NC}"
         exit 1
     fi
 else
-    nvm use 8
+    nvm use "$NODE8_VERSION"
 fi
-nvm alias default 8
+nvm alias default "$NODE8_VERSION"
 echo -e "${GREEN}当前Node版本：$(node -v)${NC}"
 echo -e "${GREEN}当前npm版本：$(npm -v)${NC}"
 
@@ -302,7 +342,7 @@ echo -e "${GREEN}✅ 工作目录准备完成${NC}"
 
 # 配置npm国内镜像
 echo -e "${YELLOW}=== 配置npm国内镜像 ===${NC}"
-# 先以root身份配置全局镜像（确保普通用户继承）
+# 先以root身份配置全局镜像
 npm config set registry https://registry.npmmirror.com
 npm config set disturl https://npmmirror.com/dist
 
@@ -324,12 +364,36 @@ sudo -u "$(logname)" bash -c "\
 
 # 安装caliper-cli
 echo -e "${YELLOW}=== 安装caliper-cli@0.2.0 ===${NC}"
-sudo -u "$(logname)" bash -c "\
-    source /etc/profile.d/nvm.sh && \
-    nvm use 8 > /dev/null 2>&1 && \
-    npm install --only=prod @hyperledger/caliper-cli@0.2.0" || { 
-    echo -e "${RED}❌ caliper-cli安装失败${NC}"; exit 1; 
-}
+MAX_RETRIES=100
+RETRY_DELAY=2
+RETRY_COUNT=0
+INSTALL_SUCCESS=0
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    sudo -u "$(logname)" bash -c "\
+        source /etc/profile.d/nvm.sh && \
+        nvm use 8 > /dev/null 2>&1 && \
+        npm install --only=prod @hyperledger/caliper-cli@0.2.0" && {
+        INSTALL_SUCCESS=1
+        break
+    }
+
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+        echo -e "${YELLOW}⚠️ caliper-cli安装失败，${RETRY_DELAY}秒后重试...${NC}"
+        sudo -u "$(logname)" bash -c "\
+            source /etc/profile.d/nvm.sh && \
+            nvm use 8 > /dev/null 2>&1 && \
+            rm -rf node_modules/@hyperledger/caliper-cli && \
+            npm cache clean --force"
+        sleep $RETRY_DELAY
+    fi
+done
+
+if [ $INSTALL_SUCCESS -ne 1 ]; then
+    echo -e "${RED}❌ 已达到最大重试次数（${MAX_RETRIES}次），caliper-cli安装失败，请检查网络后重新运行脚本${NC}"
+    exit 1
+fi
 
 # 验证caliper版本
 sudo -u "$(logname)" bash -c "\
@@ -364,7 +428,7 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
 
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-        echo -e "${YELLOW}⚠️ 绑定失败，${RETRY_DELAY}秒后重试...（第${RETRY_COUNT}次）${NC}"
+        echo -e "${YELLOW}⚠️ 绑定失败，${RETRY_DELAY}秒后重试...${NC}"
         sleep $RETRY_DELAY
     else
         echo -e "${RED}❌ 已达到最大重试次数，绑定失败${NC}"
@@ -432,10 +496,13 @@ RETRY_DELAY=2
 RETRY_COUNT=0
 SUCCESS=0
 
+set +e
+
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     sudo -u "$(logname)" bash -c "\
         source /etc/profile.d/nvm.sh && \
         nvm use 8 > /dev/null 2>&1 && \
+        export PATH=\"$NVM_DIR/versions/node/v8.17.0/bin:\$PATH\" && \
         npm install --no-fund"
     
     # 检查命令执行结果
@@ -446,12 +513,19 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-        echo -e "${YELLOW}⚠️ 依赖安装失败，${RETRY_DELAY}秒后重试）${NC}"
+        echo -e "${YELLOW}⚠️ 依赖安装失败，${RETRY_DELAY}秒后重试 ${NC}"
         sleep $RETRY_DELAY
-        sudo -u "$(logname)" rm -rf node_modules package-lock.json
-        sudo -u "$(logname)" npm cache clean --force
+        sudo -u "$(logname)" bash -c "\
+            source /etc/profile.d/nvm.sh && \
+            nvm use 8 > /dev/null 2>&1 && \
+            export PATH=\"$NVM_DIR/versions/node/v8.17.0/bin:\$PATH\" && \
+            rm -rf node_modules package-lock.json && \
+            npm cache clean --force"
     fi
 done
+
+# 恢复set -e
+set -e
 
 if [ $SUCCESS -ne 1 ]; then
     echo -e "${RED}❌ 已达到最大重试次数，依赖安装失败${NC}"
